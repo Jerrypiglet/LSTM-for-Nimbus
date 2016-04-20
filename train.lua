@@ -23,7 +23,7 @@ cmd:option('-data_dir','data/test_','data directory. Should contain the file inp
 cmd:option('-rnn_size', 32, 'size of LSTM internal state')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
 cmd:option('-model', 'lstm', 'lstm, gru or rnn')
-cmd:option('-n_class', 10, 'number of categories')
+cmd:option('-n_class', 2, 'number of categories')
 cmd:option('-nbatches', 1000, 'number of training batches loader prepare')
 -- optimization
 cmd:option('-learning_rate',1e-2,'learning rate')
@@ -31,9 +31,9 @@ cmd:option('-learning_rate_decay',0.1,'learning rate decay')
 cmd:option('-learning_rate_decay_every', 5,'in number of epochs, when to start decaying the learning rate')
 cmd:option('-decay_rate',0.95,'decay rate for rmsprop')
 cmd:option('-dropout',0.5,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
-cmd:option('-seq_length', 3,'number of timesteps to unroll for')
-cmd:option('-batch_size', 512,'number of sequences to train on in parallel')
-cmd:option('-max_epochs', 5,'number of full passes through the training data')
+cmd:option('-seq_length', 1024,'number of timesteps to unroll for')
+cmd:option('-batch_size',256,'number of sequences to train on in parallel')
+cmd:option('-max_epochs', 20,'number of full passes through the training data')
 cmd:option('-grad_clip',5,'clip gradients at this value')
 cmd:option('-train_frac',0.95,'fraction of data that goes into train set')
 cmd:option('-val_frac',0.05,'fraction of data that goes into validation set')
@@ -42,11 +42,11 @@ cmd:option('-init_from', '', 'initialize network parameters from checkpoint at t
 -- bookkeeping
 cmd:option('-seed',123,'torch manual random number generator seed')
 cmd:option('-print_every',5,'how many steps/minibatches between printing out the loss')
-cmd:option('-eval_val_every', 2 ,'every how many epochs should we evaluate on validation data?')
-cmd:option('-checkpoint_dir', 'cv3', 'output directory where checkpoints get written')
-cmd:option('-savefile','lstm','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
+cmd:option('-eval_val_every', 100,'every how many epochs should we evaluate on validation data?')
+cmd:option('-checkpoint_dir', 'checkPoints', 'output directory where checkpoints get written')
+cmd:option('-savefile','lstmNimbus','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
 -- GPU/CPU
-cmd:option('-gpuid',0,'which gpu to use. -1 = use CPU')
+cmd:option('-gpuid',1,'which gpu to use. -1 = use CPU')
 cmd:option('-opencl',0,'use OpenCL (instead of CUDA)')
 cmd:text()
 
@@ -100,7 +100,7 @@ end
 -- create the data loader class
 local loader = DataLoader.create(opt.data_dir, opt.batch_size, opt.seq_length, split_sizes, opt.n_class, opt.nbatches)
 local vocab_size = loader.vocab_size  -- the number of distinct characters
-local vocab = loader.vocab_mapping
+-- local vocab = loader.vocab_mapping
 print('vocab size: ' .. vocab_size)
 -- make sure output directory exists
 if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
@@ -156,12 +156,12 @@ end
 if opt.gpuid >= 0 and opt.opencl == 0 then
     for k,v in pairs(protos) do v:cuda() end
 end
-if opt.gpuid >= 0 and opt.opencl == 1 then
-    for k,v in pairs(protos) do v:cl() end
-end
+-- if opt.gpuid >= 0 and opt.opencl == 1 then
+--     for k,v in pairs(protos) do v:cl() end
+-- end
 
 -- put the above things into one flattened parameters tensor
--- why use model_utils???? since it is able to flatten two networks at the same time
+-- why use model_utils? since it is able to flatten two networks at the same time
 params, grad_params = model_utils.combine_all_parameters(protos.rnn)
 -- params, grad_params = protos.rnn:getParameters()
 --
@@ -194,19 +194,25 @@ for name,proto in pairs(protos) do
     clones[name] = model_utils.clone_many_times(proto, opt.seq_length, not proto.parameters)
 end
 
--- evaluate the loss over an entire split
-function eval_split(split_index, max_batches)
-    print('evaluating loss over split index ' .. split_index)
-    local n = loader.split_sizes[split_index]
-    if max_batches ~= nil then n = math.min(max_batches, n) end
 
-    loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
+--=============================================
+-- evaluate the loss over an entire split
+--=============================================
+function eval_split(split_index, max_batches)
+    print('----- evaluating loss over split index ' .. split_index)
+    -- local n = loader.split_sizes[split_index]
+    -- local n = math.floor(loader.dataLengthTest / opt.seq_length / opt.batch_size)
+    local n = 1
+    -- print(loader.dataLengthTest, opt.seq_length, opt.batch_size)
+    -- if max_batches ~= nil then n = math.min(max_batches, n) end
+
+    -- loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
     local loss = 0
     local rnn_state = {[0] = init_state}
     
     for i = 1,n do -- iterate over batches in the split
         -- fetch a batch
-        local x, y = loader:next_batch(split_index)
+        local x, y = loader:next_batch(split_index, i)
         if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
             -- have to convert to float because integers can't be cuda()'d
             x = x:float():cuda()
@@ -219,23 +225,30 @@ function eval_split(split_index, max_batches)
         -- forward pass
         for t=1,opt.seq_length do
             clones.rnn[t]:evaluate() -- for dropout proper functioning
-            local x_OneHot = OneHot(vocab_size):forward(x[{{}, t}]):cuda()
+            -- local x_OneHot = OneHot(vocab_size):forward(x[{{}, t}]):cuda()
+            local x_OneHot = x[t]:cuda()
             local lst = clones.rnn[t]:forward{x_OneHot, unpack(rnn_state[t-1])}
             rnn_state[t] = {}
             for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
             prediction = lst[#lst] 
-            loss = loss + clones.criterion[t]:forward(prediction, y)
+            loss = loss + clones.criterion[t]:forward(prediction, y[t])
         end
         -- carry over lstm state
         rnn_state[0] = rnn_state[#rnn_state]
-        print(i .. '/' .. n .. '...')
+        -- print(i .. '/' .. n .. '...')
     end
 
     loss = loss / opt.seq_length / n
+    print('----- loss ' .. loss)
     return loss
 end
 
+
+--=============================================
+-- [feval]
 -- do fwd/bwd and return loss, grad_params
+--=============================================
+
 local init_state_global = clone_list(init_state)
 -- still don't know how to change grad_params, 
 -- How copy_many_times and combine_all_parameters work
@@ -243,13 +256,14 @@ local init_state_global = clone_list(init_state)
 -- grad_params is being accumulated through time steps, which means the gradient for each time step is accumulated for the whole sequence length
 -- And the clones is like a pointer, which just change the original protos.rnn automatically
 function feval(x)
+        -- print('mark 3-----')
     if x ~= params then
         params:copy(x)
     end
     grad_params:zero()
 
     ------------------ get minibatch -------------------
-    local x, y = loader:next_batch(1)
+    local x, y = loader:next_batch(1) -- 1: training
     if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
         -- have to convert to float because integers can't be cuda()'d
         x = x:float():cuda()
@@ -262,32 +276,39 @@ function feval(x)
 
     -- this is for random dropping a few entries' gradients
     d_rate = 0.5
-    randdroping_mask = y:clone()
-    chosen_mask = torch.randperm(10)[{{1,math.floor(opt.n_class*d_rate)}}]:cuda()
-    chosen_mask = chosen_mask:repeatTensor(y:size(1), 1)
-    randdroping_mask:scatter(2, chosen_mask, 1)
+    -- t = 1
+    -- randdroping_mask = y[t]:clone()
+    -- chosen_mask = torch.randperm(10)[{{1,math.floor(opt.n_class*d_rate)}}]:cuda()
+    -- chosen_mask = chosen_mask:repeatTensor(y[t]:size(1), 1)
+    -- randdroping_mask:scatter(2, chosen_mask, 1)
 
+    -- print('mark 4-----')
     ------------------- forward pass -------------------
     local rnn_state = {[0] = init_state_global}
     local predictions = {}           -- softmax outputs
     local loss = 0
     for t=1,opt.seq_length do -- 1 to 50
         clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
-        local x_OneHot = OneHot(vocab_size):forward(x[{{}, t}]):cuda()
+        -- local x_OneHot = OneHot(vocab_size):forward(x[{{}, t}]):cuda()
+        local x_OneHot = x[t]:cuda()
         local lst = clones.rnn[t]:forward{x_OneHot, unpack(rnn_state[t-1])}
         rnn_state[t] = {}
         for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
         predictions[t] = lst[#lst] -- last element is the prediction
-        loss = loss + clones.criterion[t]:forward(predictions[t]:cmul(randdroping_mask), y) -- to randomly drop with a rate of d_rate
+
+        -- loss = loss + clones.criterion[t]:forward(predictions[t]:cmul(randdroping_mask), y[t]) -- to randomly drop with a rate of d_rate
+        loss = loss + clones.criterion[t]:forward(predictions[t], y[t]) -- to randomly drop with a rate of d_rate
     end
     -- the loss is the average loss across time steps
     loss = loss / opt.seq_length
+
+        -- print('mark 5-----')
     ------------------ backward pass -------------------
     -- initialize gradient at time t to be zeros (there's no influence from future)
     local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones, i.e. just clone the size and assign all entries to zeros
     for t=opt.seq_length,1,-1 do
         -- backprop through loss, and softmax/linear
-        local doutput_t = clones.criterion[t]:backward(predictions[t], y)
+        local doutput_t = clones.criterion[t]:backward(predictions[t], y[t])
         --[[
         if opt.lossfilter == 2 then 
             _, max_ind = torch.abs(y-predictions[t]):max(2)
@@ -299,9 +320,12 @@ function feval(x)
         --print(doutput_t)
         table.insert(drnn_state[t], doutput_t)
         -- still don't know why dlst[1] is empty
-        print(drnn_state[t])
-        io.read()
-        local dlst = clones.rnn[t]:backward({x[{{}, t}], unpack(rnn_state[t-1])}, drnn_state[t])
+        -- print(drnn_state[t])
+        -- io.read()
+                -- print('mark 6-----')
+                local x_OneHot = x[t]:cuda()
+        local dlst = clones.rnn[t]:backward({x_OneHot, unpack(rnn_state[t-1])}, drnn_state[t])
+                -- print('mark 7-----')
         -- dlst is dlst_dI, need to feed to the previous time step
         drnn_state[t-1] = {}
         for k,v in pairs(dlst) do
@@ -316,6 +340,7 @@ function feval(x)
         end
     end
     -- print 'Out of sequence'
+
     ------------------------ misc ----------------------
     -- transfer final state to initial state (BPTT)
     init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
@@ -325,7 +350,12 @@ function feval(x)
     return loss, grad_params
 end
 
+
+
+
+--=============================================
 -- start optimization here
+--=============================================
 
 print("start training:")
 train_losses = {}
@@ -353,7 +383,11 @@ for i = 1, iterations do
     end
 
     local timer = torch.Timer()
+    -- print('mark-----')
     local _, loss = optim.rmsprop(feval, params, optim_state)
+    -- local _, loss = optim.sgd(feval, params, optim_state)
+
+        -- print('mark 2-----')
     local time = timer:time().real
 
     local train_loss = loss[1] -- the loss is inside a list, pop it
@@ -377,12 +411,12 @@ for i = 1, iterations do
     end
 
     -- every now and then or on last iteration
-    if is_new_epoch and epoch % opt.eval_val_every == 0 or i == iterations then
+    if i % opt.eval_val_every == 0 or i == iterations then
         -- evaluate loss on validation data
-        local val_loss = eval_split(2) -- 2 = validation
-        val_losses[i] = val_loss
+        -- local val_loss = eval_split(2) -- 2 = validation
+        -- val_losses[i] = val_loss
 
-        local savefile = string.format('%s/lm_%s_epoch%d_%.2f.t7', opt.checkpoint_dir, opt.savefile, epoch, val_loss)
+        local savefile = string.format('%s/lm_%s_epoch%d_%.2f.t7', opt.checkpoint_dir, opt.savefile, epoch, train_loss)
         print('saving checkpoint to ' .. savefile)
         local checkpoint = {}
         checkpoint.protos = protos
@@ -416,5 +450,3 @@ for i = 1, iterations do
         break -- halt
     end
 end
-
-
