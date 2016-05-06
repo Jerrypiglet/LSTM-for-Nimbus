@@ -5,6 +5,8 @@ require 'lfs'
 
 require 'util.OneHot'
 require 'util.misc'
+matio = require 'matio'
+
 local DataLoader = require 'util.DataLoader'
 local model_utils = require 'util.model_utils'
 local LSTM = require 'model.LSTM'
@@ -23,7 +25,7 @@ cmd:option('-data_dir','data/test_','data directory. Should contain the file inp
 cmd:option('-rnn_size', 32, 'size of LSTM internal state')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
 cmd:option('-model', 'lstm', 'lstm, gru or rnn')
-cmd:option('-n_class', 2, 'number of categories')
+cmd:option('-n_class', 1, 'number of categories')
 cmd:option('-nbatches', 1000, 'number of training batches loader prepare')
 -- optimization
 cmd:option('-learning_rate',1e-2,'learning rate')
@@ -31,7 +33,7 @@ cmd:option('-learning_rate_decay',0.1,'learning rate decay')
 cmd:option('-learning_rate_decay_every', 5,'in number of epochs, when to start decaying the learning rate')
 cmd:option('-decay_rate',0.95,'decay rate for rmsprop')
 cmd:option('-dropout',0.5,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
-cmd:option('-seq_length', 1024,'number of timesteps to unroll for')
+cmd:option('-seq_length',1024,'number of timesteps to unroll for') -- 1024, 256
 cmd:option('-batch_size',256,'number of sequences to train on in parallel')
 cmd:option('-max_epochs', 20,'number of full passes through the training data')
 cmd:option('-grad_clip',5,'clip gradients at this value')
@@ -42,7 +44,7 @@ cmd:option('-init_from', '', 'initialize network parameters from checkpoint at t
 -- bookkeeping
 cmd:option('-seed',123,'torch manual random number generator seed')
 cmd:option('-print_every',5,'how many steps/minibatches between printing out the loss')
-cmd:option('-eval_val_every', 100,'every how many epochs should we evaluate on validation data?')
+cmd:option('-eval_val_every', 50,'every how many epochs should we evaluate on validation data?')
 cmd:option('-checkpoint_dir', 'checkPoints', 'output directory where checkpoints get written')
 cmd:option('-savefile','lstmNimbus','filename to autosave the checkpont to. Will be inside checkpoint_dir/')
 -- GPU/CPU
@@ -111,14 +113,7 @@ if string.len(opt.init_from) > 0 then
     print('loading an LSTM from checkpoint ' .. opt.init_from)
     local checkpoint = torch.load(opt.init_from)
     protos = checkpoint.protos
-    -- make sure the vocabs are the same
-    local vocab_compatible = true
-    for c,i in pairs(checkpoint.vocab) do 
-        if not vocab[c] == i then 
-            vocab_compatible = false
-        end
-    end
-    assert(vocab_compatible, 'error, the character vocabulary for this dataset and the one in the saved checkpoint are not the same. This is trouble.')
+
     -- overwrite model settings based on checkpoint to ensure compatibility
     print('overwriting rnn_size=' .. checkpoint.opt.rnn_size .. ', num_layers=' .. checkpoint.opt.num_layers .. ' based on the checkpoint.')
     opt.rnn_size = checkpoint.opt.rnn_size
@@ -210,7 +205,13 @@ function eval_split(split_index, max_batches)
     local loss = 0
     local rnn_state = {[0] = init_state}
     
-    for i = 1,n do -- iterate over batches in the split
+    if split_index == 2 then
+        -- file = torch.DiskFile('valY.txt', 'w')
+        predAll = torch.Tensor(opt.seq_length, opt.batch_size, opt.n_class)
+        yAll = torch.Tensor(opt.seq_length, opt.batch_size, opt.n_class)
+    end
+
+    for i = 1,n do -- iterate over batches in the split; just testing one batch
         -- fetch a batch
         local x, y = loader:next_batch(split_index, i)
         if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
@@ -230,16 +231,45 @@ function eval_split(split_index, max_batches)
             local lst = clones.rnn[t]:forward{x_OneHot, unpack(rnn_state[t-1])}
             rnn_state[t] = {}
             for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
-            prediction = lst[#lst] 
+            prediction = lst[#lst]
             loss = loss + clones.criterion[t]:forward(prediction, y[t])
+
+            predAll[t] = prediction:double()
+            -- print(prediction)
+            yAll[t] = y[t]:float()
+            -- if i == 1 and t == 1 then
+            --     predAll = prediction:clone()
+            --     yAll
+
+            -- if split_index == 2 do
+                -- file.writeString()
         end
         -- carry over lstm state
         rnn_state[0] = rnn_state[#rnn_state]
-        -- print(i .. '/' .. n .. '...')
+
+        if split_index == 2 then
+            predAll = predAll:transpose(1, 2)
+            yAll = yAll:transpose(1, 2)
+            predFlat = torch.Tensor(opt.seq_length * opt.batch_size, opt.n_class)
+            yFlat = torch.Tensor(opt.seq_length * opt.batch_size, opt.n_class)
+            for i = 1, opt.batch_size do
+                for j = 1, opt.seq_length do
+                    predFlat[(i-1)*opt.seq_length+j] = predAll[i][j]
+                    yFlat[(i-1)*opt.seq_length+j] = yAll[i][j]
+                end
+            end
+        end
+
+
+
     end
 
     loss = loss / opt.seq_length / n
     print('----- loss ' .. loss)
+
+    matio.save(string.format('predAll_%.2f.mat', loss) , {predAll=predFlat})
+    matio.save(string.format('yAll_%.2f.mat', loss), {yAll=yFlat})
+    -- print(yAll)
     return loss
 end
 
@@ -361,7 +391,8 @@ print("start training:")
 train_losses = {}
 val_losses = {}
 local optim_state = {learningRate = opt.learning_rate, alpha = opt.decay_rate}
---[[
+
+--[[]
 local optimState = {
     learningRate = opt.learningRate,
     learningRateDecay = 0.0,
@@ -369,7 +400,8 @@ local optimState = {
                          dampening = 0.0,
                               weightDecay = opt.weightDecay
 }
---]]
+]]--
+
 local iterations = opt.max_epochs * loader.ntrain
 local iterations_per_epoch = loader.ntrain
 local loss0 = nil
@@ -413,15 +445,14 @@ for i = 1, iterations do
     -- every now and then or on last iteration
     if i % opt.eval_val_every == 0 or i == iterations then
         -- evaluate loss on validation data
-        -- local val_loss = eval_split(2) -- 2 = validation
-        -- val_losses[i] = val_loss
+        local val_loss = eval_split(2) -- 2 = validation
+        val_losses[i] = val_loss
 
-        local savefile = string.format('%s/lm_%s_epoch%d_%.2f.t7', opt.checkpoint_dir, opt.savefile, epoch, train_loss)
+        local savefile = string.format('%s/lm_%s_%.2f_epoch%d_%.2f.t7', opt.checkpoint_dir, opt.savefile, val_loss, epoch, train_loss)
         print('saving checkpoint to ' .. savefile)
         local checkpoint = {}
         checkpoint.protos = protos
         checkpoint.opt = opt
-        --[[
         checkpoint.train_losses = train_losses
         checkpoint.val_loss = val_loss
         checkpoint.val_losses = val_losses
@@ -429,8 +460,8 @@ for i = 1, iterations do
         checkpoint.epoch = epoch
         checkpoint.vocab = loader.vocab_mapping
         checkpoint.loader = loader
-        --]]
         torch.save(savefile, checkpoint)
+
     end
 
     if i % opt.print_every == 0 then

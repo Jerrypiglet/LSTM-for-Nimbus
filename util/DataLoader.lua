@@ -26,7 +26,7 @@ function DataLoader.create(data_dir, batch_size, seq_length, split_fractions, n_
     self.nbatches = nbatches or 1000
     self.batch_size = batch_size
     self.seq_length = seq_length
-    self.n_class = 2
+    self.n_class = 1
     self.vocab_size = 6
     self.ntrain = 500
 
@@ -36,9 +36,18 @@ function DataLoader.create(data_dir, batch_size, seq_length, split_fractions, n_
     self.dataY = matio.load('dataY.mat', 'dataY')
     self.dataLength = self.dataX:size(1)
 
-    self.dataXtest = matio.load('dataXtest.mat', 'dataXtest')
-    self.dataYtest = matio.load('dataYtest.mat', 'dataYtest')
-    self.dataLengthTest = self.dataXtest:size(1)
+    self.dataXtestOri = matio.load('dataXtest.mat', 'dataXtest')
+    self.dataYtestOri = matio.load('dataYtest.mat', 'dataYtest')
+    self.dataLengthTestOri = self.dataYtestOri:size(1)
+
+    local numOfRep = math.ceil(batch_size * seq_length / self.dataLengthTestOri)
+    self.dataXtest = self.dataXtestOri:clone()
+    self.dataYtest = self.dataYtestOri:clone()
+
+    for i = 1, numOfRep-1 do
+        self.dataXtest = torch.cat(self.dataXtest, self.dataXtestOri, 1)
+        self.dataYtest = torch.cat(self.dataYtest, self.dataYtestOri, 1)
+    end
 
     -- local input_file = path.join(data_dir, 'input.txt')
     -- local vocab_file = path.join(data_dir, 'vocab.t7')
@@ -213,7 +222,7 @@ end
 
 
 function DataLoader:next_batch(split_index, batch_idx)
-    if split_index == 1 then
+    if split_index == 1 then -- training
         self.x = torch.Tensor(self.batch_size, self.seq_length, self.vocab_size)
         self.y = torch.Tensor(self.batch_size, self.seq_length, self.n_class)
         for i = 1, self.batch_size do
@@ -222,13 +231,13 @@ function DataLoader:next_batch(split_index, batch_idx)
             self.y[i] = self.dataY[{{idx,idx+self.seq_length-1}, {}}]
         end
     else
-        if split_index == 2 then
+        if split_index == 2 then -- validation
             self.x = torch.Tensor(self.batch_size, self.seq_length, self.vocab_size)
             self.y = torch.Tensor(self.batch_size, self.seq_length, self.n_class)
-            for i = 1, self.batch_size do
+            for i = 1, self.batch_size do -- how many samples in a batch
                 local idx = (batch_idx-1) * (self.batch_size * self.seq_length) + (i-1) * self.seq_length + 1
-                self.x[i] = self.dataX[{{idx,idx+self.seq_length-1}, {}}]
-                self.y[i] = self.dataY[{{idx,idx+self.seq_length-1}, {}}]
+                self.x[i] = self.dataXtest[{{idx,idx+self.seq_length-1}, {}}]
+                self.y[i] = self.dataYtest[{{idx,idx+self.seq_length-1}, {}}]
             end
         end
     end
